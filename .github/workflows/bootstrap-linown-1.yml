@@ -1,6 +1,10 @@
 name: build-linown-1
 
 on:
+  push:
+    paths:
+      - 'scripts/build-linown.sh'
+      - '.github/workflows/bootstrap-linown-1.yml'
   workflow_dispatch:
 
 permissions:
@@ -21,4 +25,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: mihomo-linown-1
-          path: /tmp/linown-release
+          path: dist/linown-1
