@@ -3,7 +3,8 @@ name: Import Meta branch and build linown-1
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
       - .github/workflows/bootstrap-linown-1.yml
 
@@ -13,10 +14,208 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       VERSION: linown-1
       REALITY_VERSION: 26.7.11
       CGO_ENABLED: 0
+
     steps:
       - name: Checkout destination repository
-        uses: actions/checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch official Meta branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch Meta https://github.com/MetaCubeX/mihomo.git upstream
+          git -C upstream rev-parse HEAD | tee upstream-commit.txt
+          test -f upstream/component/tls/reality.go
+          test -f upstream/go.mod
+          test -f upstream/go.sum
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/go.mod
+          cache: true
+          cache-dependency-path: upstream/go.sum
+
+      - name: Patch Reality client version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("upstream/component/tls/reality.go")
+          source = path.read_text(encoding="utf-8")
+
+          marker = "const RealityMaxShortIDLen = 8"
+          declaration = '''const RealityMaxShortIDLen = 8
+
+// realityClientVersion is encoded into the first three bytes of the REALITY
+// ClientHello session ID for Xray server-side client version validation.
+// Xray 26.7.11 defaults minClientVer to 26.3.27 when it is not configured.
+var realityClientVersion = [3]byte{26, 7, 11}'''
+          old_assignment = '''\t\thello.SessionId[0] = 1
+\t\thello.SessionId[1] = 8
+\t\thello.SessionId[2] = 2'''
+          new_assignment = '''\t\tcopy(hello.SessionId[:3], realityClientVersion[:])'''
+
+          if "var realityClientVersion = [3]byte{26, 7, 11}" not in source:
+              if source.count(marker) != 1:
+                  raise SystemExit(f"unexpected RealityMaxShortIDLen marker count: {source.count(marker)}")
+              source = source.replace(marker, declaration, 1)
+
+          if old_assignment in source:
+              source = source.replace(old_assignment, new_assignment, 1)
+          elif new_assignment not in source:
+              raise SystemExit("original Reality 1.8.2 assignment was not found")
+
+          path.write_text(source, encoding="utf-8")
+          PY
+
+          gofmt -w upstream/component/tls/reality.go
+          grep -Fq 'var realityClientVersion = [3]byte{26, 7, 11}' upstream/component/tls/reality.go
+          grep -Fq 'copy(hello.SessionId[:3], realityClientVersion[:])' upstream/component/tls/reality.go
+          if grep -Fq 'hello.SessionId[0] = 1' upstream/component/tls/reality.go; then
+            echo 'old Reality 1.8.2 assignment still exists' >&2
+            exit 1
+          fi
+
+      - name: Generate patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          git -C upstream diff -- component/tls/reality.go > release/mihomo-linown-1.patch
+          test -s release/mihomo-linown-1.patch
+
+      - name: Run targeted tests
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./component/tls/...
+          go test ./adapter/outbound/...
+
+      - name: Build Linux ARM64
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_TIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          LDFLAGS="-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=${VERSION} -X github.com/metacubex/mihomo/constant.BuildTime=${BUILD_TIME}"
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build \
+            -tags with_gvisor \
+            -trimpath \
+            -buildvcs=false \
+            -ldflags "${LDFLAGS}" \
+            -o ../release/mihomo-linux-arm64 \
+            .
+
+      - name: Validate binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "Version: ${VERSION}"
+            echo "Reality client version: ${REALITY_VERSION}"
+            echo "Xray default minimum: 26.3.27"
+            echo "Upstream Meta commit: $(cat upstream-commit.txt)"
+            echo
+            file release/mihomo-linux-arm64
+            echo
+            go version -m release/mihomo-linux-arm64
+          } | tee release/BUILD-INFO-linown-1.txt
+
+          file release/mihomo-linux-arm64 | grep -Eq 'ARM aarch64|ARM64|aarch64'
+          go version -m release/mihomo-linux-arm64 | grep -Fq 'GOOS=linux'
+          go version -m release/mihomo-linux-arm64 | grep -Fq 'GOARCH=arm64'
+          go version -m release/mihomo-linux-arm64 | grep -Fq 'github.com/metacubex/mihomo/constant.Version=linown-1'
+
+      - name: Package deliverables
+        shell: bash
+        run: |
+          set -euo pipefail
+          gzip -9 -c release/mihomo-linux-arm64 > release/mihomo-linux-arm64-linown-1.gz
+          rm release/mihomo-linux-arm64
+
+          mkdir -p source-package/mihomo-linown-1
+          rsync -a --exclude='.git/' upstream/ source-package/mihomo-linown-1/
+          cp release/BUILD-INFO-linown-1.txt source-package/mihomo-linown-1/
+          (
+            cd source-package
+            zip -q -r ../release/mihomo-linown-1-source.zip mihomo-linown-1
+          )
+
+          (
+            cd release
+            sha256sum \
+              mihomo-linux-arm64-linown-1.gz \
+              mihomo-linown-1-source.zip \
+              mihomo-linown-1.patch \
+              > SHA256SUMS-linown-1.txt
+          )
+
+          ls -lh release
+          cat release/SHA256SUMS-linown-1.txt
+
+      - name: Import patched source into main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .github/workflows/bootstrap-linown-1.yml /tmp/bootstrap-linown-1.yml
+
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/workflows/' \
+            upstream/ ./
+
+          mkdir -p .github/workflows
+          cp /tmp/bootstrap-linown-1.yml .github/workflows/bootstrap-linown-1.yml
+
+          rm -rf dist/linown-1
+          mkdir -p dist/linown-1
+          cp release/mihomo-linux-arm64-linown-1.gz dist/linown-1/
+          cp release/mihomo-linown-1-source.zip dist/linown-1/
+          cp release/mihomo-linown-1.patch dist/linown-1/
+          cp release/SHA256SUMS-linown-1.txt dist/linown-1/
+          cp release/BUILD-INFO-linown-1.txt dist/linown-1/
+
+          cat > LINOWN_BUILD.md <<EOF
+          # linown-1
+
+          This repository was imported from the official MetaCubeX/mihomo \`Meta\` branch.
+
+          - Upstream commit: \`$(cat upstream-commit.txt)\`
+          - Software version: \`${VERSION}\`
+          - REALITY client version: \`${REALITY_VERSION}\`
+          - Xray default minimum client version: \`26.3.27\`
+          - Target: \`linux/arm64\`
+          - CGO: disabled
+          - Build tag: \`with_gvisor\`
+
+          Build outputs are stored in \`dist/linown-1/\`.
+          EOF
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'No repository changes to commit.'
+          else
+            git commit -m 'build: import Meta and publish linown-1'
+            git push origin HEAD:main
+          fi
+
+      - name: Upload linown-1 deliverables
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-linown-1-linux-arm64
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
