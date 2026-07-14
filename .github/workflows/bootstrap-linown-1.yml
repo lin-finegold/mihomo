@@ -1,27 +1,24 @@
-name: Import Meta branch and build linown-1
+name: build-linown-1
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/bootstrap-linown-1.yml
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      VERSION: linown-1
-      REALITY_VERSION: 26.7.11
-      CGO_ENABLED: 0
-
     steps:
-      - name: Checkout destination repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          fetch
+          go-version: '1.23'
+      - name: Build
+        run: |
+          chmod +x scripts/build-linown.sh
+          scripts/build-linown.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-linown-1
+          path: /tmp/linown-release
